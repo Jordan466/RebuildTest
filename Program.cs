@@ -26,7 +26,19 @@ using TupleAsJsonArray;
 
 namespace Value
 {
-    public record Contact(string Name);
+    public record Contact(
+        string Name,
+        string CompanyName,
+        string ContactName,
+        List<string> ContactEmails,
+        List<string> ContactNumbers,
+        string FaxNumber,
+        List<string> InvoicingEmails,
+        List<string> ResultsEmails,
+        string PostalAddress,
+        string ProjectName,
+        string ProjectNumber,
+        string ProjectManager);
 }
 
 namespace Test
@@ -72,7 +84,7 @@ namespace Test
             var conn = $"User ID=postgres;Password={password};Host=localhost;Port=5432;Database={database};";
             var store = DocumentStore.For(_ => ConfigureMarten(_, conn));
             await using var session = store.OpenSession(Guid.NewGuid().ToString());
-            var @event = new ContactCreated(Guid.NewGuid(), Guid.NewGuid(), new Value.Contact("Test"));
+            var @event = new ContactCreated(Guid.NewGuid(), Guid.NewGuid(), new Value.Contact("Test", "Test", "Test", new(), new(), "Test", new(), new(), "Test", "Test", "Test", "Test"));
             session.Events.StartStream(@event.Id, @event);
             session.SaveChanges();
 
@@ -81,7 +93,7 @@ namespace Test
                 .Enrich.FromLogContext()
                 .Enrich.WithExceptionDetails()
                 .WriteTo.Async(a => a.Console());
-            var microsoftLogger = new SerilogLoggerFactory(logger.CreateLogger()).CreateLogger<Contact>(); 
+            var microsoftLogger = new SerilogLoggerFactory(logger.CreateLogger()).CreateLogger<Contact>();
 
             using var daemon = store.BuildProjectionDaemon(microsoftLogger);
             await daemon.RebuildProjection("Contact", CancellationToken.None);
