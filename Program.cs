@@ -41,19 +41,26 @@ namespace Test
         Guid Id { get; }
     }
 
-    public record SiteCreated(Guid Id, Value.Site Site) : ICreateEvent;
-    public record SiteCreated2(Guid Id, Value.Site Site) : ICreateEvent;
-    public record FooCreated(Guid Id) : ICreateEvent;
+    public interface ICreateSite {
+        Guid Id { get; }
+    }
+    // public abstract record CreateSite(Guid Id);
+    public record SiteCreated(Guid Id, Value.Site Site) : ICreateSite;
+    public record SiteCreated2(Guid Id, Value.Site Site) : ICreateSite;
+    public record FooCreated(Guid Id);
     public record SiteEdited(Guid Id, Value.Site Site) : IEvent;
 
     public record Site(Guid Id, Value.Site Value) : IEntity
     {
-        public static Site? Create(ICreateEvent ev) => ev switch
+        public static Site Create(ICreateSite ev) => ev switch
         {
             SiteCreated e => new(ev.Id, e.Site),
             SiteCreated2 e => new(ev.Id, e.Site),
-            _ => null
+            _ => new(Guid.Empty, new("This should never happen"))
         };
+
+        // public static Site Create(SiteCreated ev) => new(ev.Id, ev.Site);
+        // public static Site Create(SiteCreated2 ev) => new(ev.Id, ev.Site);
 
         public static Site Apply(Site state, IEvent ev) => ev switch
         {
@@ -69,7 +76,14 @@ namespace Test
             ProjectionName = nameof(Site);
             Lifecycle = ProjectionLifecycle.Inline;
 
-            CreateEvent<ICreateEvent>(Site.Create!);
+            CreateEvent<ICreateSite>(Site.Create);
+            // CreateEvent<ICreateSite>(e =>
+            // {
+            //     System.Console.WriteLine(e);
+            //     return Site.Create(e);
+            // });
+            // CreateEvent<SiteCreated>(Site.Create);
+            // CreateEvent<SiteCreated2>(Site.Create);
             ProjectEvent<SiteEdited>(Site.Apply);
         }
     }
@@ -82,6 +96,14 @@ namespace Test
             var password = "Password12!";
             var conn = $"User ID=postgres;Password={password};Host=localhost;Port=5432;Database={database};";
             var store = DocumentStore.For(_ => ConfigureMarten(_, conn));
+
+            var foldSites = FoldDictionary<Site>(Site.Apply, ev => ev switch
+            {
+                SiteCreated e => Site.Create(e),
+                SiteCreated2 e => Site.Create(e),
+                _ => null
+            });
+
             await using var session = store.OpenSession(Guid.NewGuid().ToString());
             var site = Guid.NewGuid();
             var site2 = Guid.NewGuid();
@@ -99,8 +121,44 @@ namespace Test
             session.Events.StartStream(createFoo.Id, createFoo);
             session.SaveChanges();
 
+            var logger = new LoggerConfiguration()
+                .MinimumLevel.Debug()
+                .Enrich.FromLogContext()
+                .Enrich.WithExceptionDetails()
+                .WriteTo.Async(a => a.Console());
+            var microsoftLogger = new SerilogLoggerFactory(logger.CreateLogger()).CreateLogger<Site>();
+
+            using var daemon = store.BuildProjectionDaemon(microsoftLogger);
+            await daemon.RebuildProjection("Site", CancellationToken.None);
+
+            var sites = await session.Query<Site>().ToListAsync();
+            foreach (var s in sites)
+                System.Console.WriteLine(s);
             System.Console.WriteLine("Done");
         }
+
+        protected static Func<Dictionary<Guid, T>, IEvent, Dictionary<Guid, T>> FoldDictionary<T>(Func<T, IEvent, T> fold, Func<ICreateEvent, T?> defaultState, Type? deleteEvent = null)
+            => new Func<Dictionary<Guid, T>, IEvent, Dictionary<Guid, T>>(
+                (dictionary, ev) =>
+                {
+                    if (ev is IEvent e)
+                    {
+                        if (ev.GetType() == deleteEvent)
+                            dictionary.Remove(ev.Id);
+                        else if (dictionary.ContainsKey(ev.Id))
+                            dictionary[ev.Id] = fold(dictionary[ev.Id], ev);
+                        else
+                            if (ev is ICreateEvent create)
+                        {
+                            var state = defaultState(create);
+                            if (state is null) return dictionary;
+                            dictionary.Add(ev.Id, fold(state, ev));
+                        }
+
+                    }
+                    return dictionary;
+                });
+
 
         public static Action<StoreOptions, string> ConfigureMarten => (_, connectionString) =>
         {
@@ -110,6 +168,7 @@ namespace Test
             {
                 c.ForTenant()
                     .CheckAgainstPgDatabase()
+                    .DropExisting()
                     .WithEncoding("UTF-8")
                     .ConnectionLimit(-1);
 
