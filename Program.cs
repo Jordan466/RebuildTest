@@ -26,19 +26,7 @@ using TupleAsJsonArray;
 
 namespace Value
 {
-    public record Contact(
-        string Name,
-        string CompanyName,
-        string ContactName,
-        List<string> ContactEmails,
-        List<string> ContactNumbers,
-        string FaxNumber,
-        List<string> InvoicingEmails,
-        List<string> ResultsEmails,
-        string PostalAddress,
-        string ProjectName,
-        string ProjectNumber,
-        string ProjectManager);
+    public record Site(string Name);
 }
 
 namespace Test
@@ -47,31 +35,42 @@ namespace Test
     {
         Guid Id { get; }
     }
+    public interface ICreateEvent : IEvent { }
     public interface IEntity
     {
         Guid Id { get; }
     }
-    public interface ICreateEvent : IEvent { }
 
-    public record ContactCreated(Guid Id, Guid Site, Value.Contact Contact) : ICreateEvent;
+    public record SiteCreated(Guid Id, Value.Site Site) : ICreateEvent;
+    public record SiteCreated2(Guid Id, Value.Site Site) : ICreateEvent;
+    public record FooCreated(Guid Id) : ICreateEvent;
+    public record SiteEdited(Guid Id, Value.Site Site) : IEvent;
 
-    public record Contact(Guid Id, Guid Site, Value.Contact Value) : IEntity
+    public record Site(Guid Id, Value.Site Value) : IEntity
     {
-        public static Contact? Create(ICreateEvent ev) => ev switch
+        public static Site? Create(ICreateEvent ev) => ev switch
         {
-            ContactCreated e => new(e.Id, e.Site, e.Contact),
+            SiteCreated e => new(ev.Id, e.Site),
+            SiteCreated2 e => new(ev.Id, e.Site),
             _ => null
+        };
+
+        public static Site Apply(Site state, IEvent ev) => ev switch
+        {
+            SiteEdited e => state with { Value = e.Site },
+            _ => state
         };
     }
 
-    public class ContactProjection : AggregateProjection<Contact>
+    public class SiteProjection : AggregateProjection<Site>
     {
-        public ContactProjection()
+        public SiteProjection()
         {
-            ProjectionName = nameof(Contact);
+            ProjectionName = nameof(Site);
             Lifecycle = ProjectionLifecycle.Inline;
 
-            CreateEvent<ICreateEvent>(Contact.Create!);
+            CreateEvent<ICreateEvent>(Site.Create!);
+            ProjectEvent<SiteEdited>(Site.Apply);
         }
     }
 
@@ -84,19 +83,22 @@ namespace Test
             var conn = $"User ID=postgres;Password={password};Host=localhost;Port=5432;Database={database};";
             var store = DocumentStore.For(_ => ConfigureMarten(_, conn));
             await using var session = store.OpenSession(Guid.NewGuid().ToString());
-            var @event = new ContactCreated(Guid.NewGuid(), Guid.NewGuid(), new Value.Contact("Test", "Test", "Test", new(), new(), "Test", new(), new(), "Test", "Test", "Test", "Test"));
-            session.Events.StartStream(@event.Id, @event);
+            var site = Guid.NewGuid();
+            var site2 = Guid.NewGuid();
+            var createEv = new SiteCreated(site, new("Test"));
+            var createEv2 = new SiteCreated2(site2, new("Test"));
+            var editEv = new SiteEdited(site, new("Test 2"));
+            var createFoo = new FooCreated(Guid.NewGuid());
+
+            session.Events.StartStream(createEv.Id, createEv);
+            session.SaveChanges();
+            session.Events.Append(editEv.Id, editEv);
+            session.SaveChanges();
+            session.Events.StartStream(createEv2.Id, createEv2);
+            session.SaveChanges();
+            session.Events.StartStream(createFoo.Id, createFoo);
             session.SaveChanges();
 
-            var logger = new LoggerConfiguration()
-                .MinimumLevel.Verbose()
-                .Enrich.FromLogContext()
-                .Enrich.WithExceptionDetails()
-                .WriteTo.Async(a => a.Console());
-            var microsoftLogger = new SerilogLoggerFactory(logger.CreateLogger()).CreateLogger<Contact>();
-
-            using var daemon = store.BuildProjectionDaemon(microsoftLogger);
-            await daemon.RebuildProjection("Contact", CancellationToken.None);
             System.Console.WriteLine("Done");
         }
 
@@ -121,7 +123,7 @@ namespace Test
             _.Events.StreamIdentity = StreamIdentity.AsGuid;
             _.GeneratedCodeMode = TypeLoadMode.LoadFromPreBuiltAssembly;
 
-            _.Projections.Add(new ContactProjection());
+            _.Projections.Add(new SiteProjection());
         };
 
         private static void ConfigureJsonSerializerOptions(JsonSerializerOptions options)
