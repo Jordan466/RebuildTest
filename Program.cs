@@ -1,8 +1,5 @@
-﻿using System;
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.Threading;
-using System.Threading.Tasks;
 using Dahomey.Json;
 using Dahomey.Json.Serialization.Conventions;
 using Dahomey.Json.Serialization.Converters.DictionaryKeys;
@@ -41,31 +38,18 @@ namespace Test
         Guid Id { get; }
     }
 
-    public interface ICreateSite {
-        Guid Id { get; }
-    }
-    // public abstract record CreateSite(Guid Id);
+    public interface ICreateSite : ICreateEvent { }
     public record SiteCreated(Guid Id, Value.Site Site) : ICreateSite;
     public record SiteCreated2(Guid Id, Value.Site Site) : ICreateSite;
-    public record FooCreated(Guid Id);
-    public record SiteEdited(Guid Id, Value.Site Site) : IEvent;
+    public record FooCreated(Guid Id) : ICreateEvent;
 
     public record Site(Guid Id, Value.Site Value) : IEntity
     {
-        public static Site Create(ICreateSite ev) => ev switch
+        public static Site Create(ICreateEvent ev) => ev switch
         {
             SiteCreated e => new(ev.Id, e.Site),
             SiteCreated2 e => new(ev.Id, e.Site),
             _ => new(Guid.Empty, new("This should never happen"))
-        };
-
-        // public static Site Create(SiteCreated ev) => new(ev.Id, ev.Site);
-        // public static Site Create(SiteCreated2 ev) => new(ev.Id, ev.Site);
-
-        public static Site Apply(Site state, IEvent ev) => ev switch
-        {
-            SiteEdited e => state with { Value = e.Site },
-            _ => state
         };
     }
 
@@ -77,14 +61,6 @@ namespace Test
             Lifecycle = ProjectionLifecycle.Inline;
 
             CreateEvent<ICreateSite>(Site.Create);
-            // CreateEvent<ICreateSite>(e =>
-            // {
-            //     System.Console.WriteLine(e);
-            //     return Site.Create(e);
-            // });
-            // CreateEvent<SiteCreated>(Site.Create);
-            // CreateEvent<SiteCreated2>(Site.Create);
-            ProjectEvent<SiteEdited>(Site.Apply);
         }
     }
 
@@ -97,24 +73,14 @@ namespace Test
             var conn = $"User ID=postgres;Password={password};Host=localhost;Port=5432;Database={database};";
             var store = DocumentStore.For(_ => ConfigureMarten(_, conn));
 
-            var foldSites = FoldDictionary<Site>(Site.Apply, ev => ev switch
-            {
-                SiteCreated e => Site.Create(e),
-                SiteCreated2 e => Site.Create(e),
-                _ => null
-            });
-
             await using var session = store.OpenSession(Guid.NewGuid().ToString());
             var site = Guid.NewGuid();
             var site2 = Guid.NewGuid();
             var createEv = new SiteCreated(site, new("Test"));
             var createEv2 = new SiteCreated2(site2, new("Test"));
-            var editEv = new SiteEdited(site, new("Test 2"));
             var createFoo = new FooCreated(Guid.NewGuid());
 
             session.Events.StartStream(createEv.Id, createEv);
-            session.SaveChanges();
-            session.Events.Append(editEv.Id, editEv);
             session.SaveChanges();
             session.Events.StartStream(createEv2.Id, createEv2);
             session.SaveChanges();
@@ -136,29 +102,6 @@ namespace Test
                 System.Console.WriteLine(s);
             System.Console.WriteLine("Done");
         }
-
-        protected static Func<Dictionary<Guid, T>, IEvent, Dictionary<Guid, T>> FoldDictionary<T>(Func<T, IEvent, T> fold, Func<ICreateEvent, T?> defaultState, Type? deleteEvent = null)
-            => new Func<Dictionary<Guid, T>, IEvent, Dictionary<Guid, T>>(
-                (dictionary, ev) =>
-                {
-                    if (ev is IEvent e)
-                    {
-                        if (ev.GetType() == deleteEvent)
-                            dictionary.Remove(ev.Id);
-                        else if (dictionary.ContainsKey(ev.Id))
-                            dictionary[ev.Id] = fold(dictionary[ev.Id], ev);
-                        else
-                            if (ev is ICreateEvent create)
-                        {
-                            var state = defaultState(create);
-                            if (state is null) return dictionary;
-                            dictionary.Add(ev.Id, fold(state, ev));
-                        }
-
-                    }
-                    return dictionary;
-                });
-
 
         public static Action<StoreOptions, string> ConfigureMarten => (_, connectionString) =>
         {
