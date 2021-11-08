@@ -1,4 +1,5 @@
-﻿using System.Text.Json;
+﻿using System.Linq;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using Dahomey.Json;
 using Dahomey.Json.Serialization.Conventions;
@@ -16,6 +17,7 @@ using Marten.Storage;
 using Microsoft.Extensions.Logging;
 using NodaTime;
 using NodaTime.Serialization.SystemTextJson;
+using Npgsql;
 using Serilog;
 using Serilog.Exceptions;
 using Serilog.Extensions.Logging;
@@ -38,9 +40,9 @@ namespace Test
         Guid Id { get; }
     }
 
-    public interface ICreateSite : ICreateEvent { }
-    public record SiteCreated(Guid Id, Value.Site Site) : ICreateSite;
-    public record SiteCreated2(Guid Id, Value.Site Site) : ICreateSite;
+    public record SiteCreated(Guid Id, Value.Site Site) : ICreateEvent;
+    public record SiteCreated2(Guid Id, Value.Site Site) : ICreateEvent;
+    public record SiteEdited(Guid Id, Value.Site Site) : IEvent;
     public record FooCreated(Guid Id) : ICreateEvent;
 
     public record Site(Guid Id, Value.Site Value) : IEntity
@@ -51,6 +53,12 @@ namespace Test
             SiteCreated2 e => new(ev.Id, e.Site),
             _ => new(Guid.Empty, new("This should never happen"))
         };
+
+        public static Site Apply(Site state, IEvent ev) => ev switch
+        {
+            SiteEdited e => state with { Value = e.Site },
+            _ => state
+        };
     }
 
     public class SiteProjection : AggregateProjection<Site>
@@ -60,7 +68,7 @@ namespace Test
             ProjectionName = nameof(Site);
             Lifecycle = ProjectionLifecycle.Inline;
 
-            CreateEvent<ICreateSite>(Site.Create);
+            CreateEvent<ICreateEvent>(Site.Create);
         }
     }
 
@@ -72,8 +80,11 @@ namespace Test
             var password = "Password12!";
             var conn = $"User ID=postgres;Password={password};Host=localhost;Port=5432;Database={database};";
             var store = DocumentStore.For(_ => ConfigureMarten(_, conn));
+            var jsonsettings = new JsonSerializerOptions();
+            ConfigureJsonSerializerOptions(jsonsettings);
 
-            await using var session = store.OpenSession(Guid.NewGuid().ToString());
+            var tenant = Guid.NewGuid().ToString();
+            await using var session = store.OpenSession(tenant);
             var site = Guid.NewGuid();
             var site2 = Guid.NewGuid();
             var createEv = new SiteCreated(site, new("Test"));
@@ -87,18 +98,39 @@ namespace Test
             session.Events.StartStream(createFoo.Id, createFoo);
             session.SaveChanges();
 
-            var logger = new LoggerConfiguration()
-                .MinimumLevel.Debug()
-                .Enrich.FromLogContext()
-                .Enrich.WithExceptionDetails()
-                .WriteTo.Async(a => a.Console());
-            var microsoftLogger = new SerilogLoggerFactory(logger.CreateLogger()).CreateLogger<Site>();
+            var sites = new Dictionary<Guid, Site>();
+            Projections.Add(typeof(Site), sites);
+            Folders = new (dynamic, dynamic, dynamic)[] {
+                Folder<Site, Dictionary<Guid, Site>>(FoldDictionary<Site>(Site.Apply, Site.Create)),
+            };
+            Update(new() { createEv, createEv2, createFoo });
 
-            using var daemon = store.BuildProjectionDaemon(microsoftLogger);
-            await daemon.RebuildProjection("Site", CancellationToken.None);
+            await using var npg = new NpgsqlConnection(conn);
+            await npg.OpenAsync();
+            var t = await npg.BeginTransactionAsync();
 
-            var sites = await session.Query<Site>().ToListAsync();
+            await using var cmd = new NpgsqlCommand("delete from mt_doc_site;", npg);
+            await cmd.ExecuteNonQueryAsync();
+            System.Console.WriteLine(sites.Count);
             foreach (var s in sites)
+            {
+                await using (var insert = new NpgsqlCommand("insert into @table values (@id, @tenant_id, @data, @mt_last_Modified, @mt_version, @mt_dotnet_type);", npg))
+                {
+                    cmd.Parameters.AddWithValue("table", "mt_doc_site");
+                    cmd.Parameters.AddWithValue("id", tenant);
+                    cmd.Parameters.AddWithValue("tenant_id", s.Key);
+                    cmd.Parameters.AddWithValue("data", JsonSerializer.Serialize(s.Value, jsonsettings));
+                    cmd.Parameters.AddWithValue("mt_last_Modified", "NOW()");
+                    cmd.Parameters.AddWithValue("mt_version", Guid.NewGuid());
+                    cmd.Parameters.AddWithValue("mt_dotnet_type", typeof(Site).FullName!);
+
+                    await cmd.ExecuteNonQueryAsync();
+                }
+            }
+            await t.CommitAsync();
+
+            var sites2 = await session.Query<Site>().ToListAsync();
+            foreach (var s in sites2)
                 System.Console.WriteLine(s);
             System.Console.WriteLine("Done");
         }
@@ -140,6 +172,57 @@ namespace Test
             registry.DiscriminatorPolicy = DiscriminatorPolicy.Always;
             Action<ObjectMapping<T>> SetDiscriminator<T>() => objectMapping => objectMapping.AutoMap().SetDiscriminator(typeof(T).Name);
             var objectMap = options.GetObjectMappingRegistry();
+        }
+
+        protected static Func<Dictionary<Guid, T>, IEvent, Dictionary<Guid, T>> FoldDictionary<T>(Func<T, IEvent, T> fold, Func<ICreateEvent, T?> defaultState, Type? deleteEvent = null)
+            => new Func<Dictionary<Guid, T>, IEvent, Dictionary<Guid, T>>(
+                (dictionary, ev) =>
+                {
+                    if (ev is IEvent e)
+                    {
+                        if (ev.GetType() == deleteEvent)
+                            dictionary.Remove(ev.Id);
+                        else if (dictionary.ContainsKey(ev.Id))
+                            dictionary[ev.Id] = fold(dictionary[ev.Id], ev);
+                        else
+                            if (ev is ICreateEvent create)
+                        {
+                            var state = defaultState(create);
+                            if (state is null) return dictionary;
+                            dictionary.Add(ev.Id, fold(state, ev));
+                        }
+
+                    }
+                    return dictionary;
+                });
+
+        protected static (dynamic, dynamic, dynamic) Folder<T, TProjection>(Func<TProjection, IEvent, TProjection> fold) => (fold, Projections[typeof(T)], new Action<dynamic>(x => Projections[typeof(T)] = x));
+        protected static (dynamic, dynamic, dynamic)[] Folders { get; set; } = Array.Empty<(dynamic, dynamic, dynamic)>();
+        protected static Dictionary<Type, dynamic> Projections { get; } = new();
+
+        public static List<IEvent> Events { get; } = new();
+        public static void Update(List<IEvent> events)
+        {
+            Events.AddRange(events);
+            foreach (var (folder, projection, set) in Folders)
+            {
+                dynamic p = projection;
+                foreach (var ev in events)
+                    p = folder(p, ev);
+                set(p);
+            }
+        }
+
+        public void Update(List<ICreateEvent> events)
+        {
+            Events.AddRange(events);
+            foreach (var (folder, projection, set) in Folders)
+            {
+                dynamic p = projection;
+                foreach (var ev in events)
+                    p = folder(p, ev);
+                set(p);
+            }
         }
     }
 }
