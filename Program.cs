@@ -1,8 +1,5 @@
-﻿using System;
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.Json.Serialization;
-using System.Threading;
-using System.Threading.Tasks;
 using Dahomey.Json;
 using Dahomey.Json.Serialization.Conventions;
 using Dahomey.Json.Serialization.Converters.DictionaryKeys;
@@ -35,30 +32,25 @@ namespace Test
     {
         Guid Id { get; }
     }
-    public interface ICreateEvent : IEvent { }
     public interface IEntity
     {
         Guid Id { get; }
     }
 
-    public record SiteCreated(Guid Id, Value.Site Site) : ICreateEvent;
-    public record SiteCreated2(Guid Id, Value.Site Site) : ICreateEvent;
-    public record FooCreated(Guid Id) : ICreateEvent;
-    public record SiteEdited(Guid Id, Value.Site Site) : IEvent;
+    public interface ICreateSite {
+        Guid Id { get; }
+    }
+    public record SiteCreated(Guid Id, Value.Site Site) : ICreateSite;
+    public record SiteCreated2(Guid Id, Value.Site Site) : ICreateSite;
+    public record FooCreated(Guid Id);
 
     public record Site(Guid Id, Value.Site Value) : IEntity
     {
-        public static Site? Create(ICreateEvent ev) => ev switch
+        public static Site Create(ICreateSite ev) => ev switch
         {
             SiteCreated e => new(ev.Id, e.Site),
             SiteCreated2 e => new(ev.Id, e.Site),
-            _ => null
-        };
-
-        public static Site Apply(Site state, IEvent ev) => ev switch
-        {
-            SiteEdited e => state with { Value = e.Site },
-            _ => state
+            _ => new(Guid.Empty, new("This should never happen"))
         };
     }
 
@@ -69,36 +61,45 @@ namespace Test
             ProjectionName = nameof(Site);
             Lifecycle = ProjectionLifecycle.Inline;
 
-            CreateEvent<ICreateEvent>(Site.Create!);
-            ProjectEvent<SiteEdited>(Site.Apply);
+            CreateEvent<ICreateSite>(Site.Create);
         }
     }
 
     public class Program
     {
+        private static ILogger<Site>? logger =>
+            new SerilogLoggerFactory(new LoggerConfiguration()
+            .MinimumLevel.Debug()
+            .Enrich.FromLogContext()
+            .Enrich.WithExceptionDetails()
+            .WriteTo.Async(a => a.Console()).CreateLogger())
+            .CreateLogger<Site>();
+
         public static async Task Main(string[] args)
         {
             var database = "test";
             var password = "Password12!";
             var conn = $"User ID=postgres;Password={password};Host=localhost;Port=5432;Database={database};";
             var store = DocumentStore.For(_ => ConfigureMarten(_, conn));
+
             await using var session = store.OpenSession(Guid.NewGuid().ToString());
-            var site = Guid.NewGuid();
-            var site2 = Guid.NewGuid();
-            var createEv = new SiteCreated(site, new("Test"));
-            var createEv2 = new SiteCreated2(site2, new("Test"));
-            var editEv = new SiteEdited(site, new("Test 2"));
+            var createSite = new SiteCreated(Guid.NewGuid(), new("Test"));
+            var createSite2 = new SiteCreated2(Guid.NewGuid(), new("Test"));
             var createFoo = new FooCreated(Guid.NewGuid());
 
-            session.Events.StartStream(createEv.Id, createEv);
+            session.Events.StartStream(createSite.Id, createSite);
             session.SaveChanges();
-            session.Events.Append(editEv.Id, editEv);
-            session.SaveChanges();
-            session.Events.StartStream(createEv2.Id, createEv2);
+            session.Events.StartStream(createSite2.Id, createSite2);
             session.SaveChanges();
             session.Events.StartStream(createFoo.Id, createFoo);
             session.SaveChanges();
 
+            using var daemon = store.BuildProjectionDaemon(logger);
+            await daemon.RebuildProjection("Site", CancellationToken.None);
+
+            var sites = await session.Query<Site>().ToListAsync();
+            foreach (var s in sites)
+                System.Console.WriteLine(s);
             System.Console.WriteLine("Done");
         }
 
@@ -110,6 +111,7 @@ namespace Test
             {
                 c.ForTenant()
                     .CheckAgainstPgDatabase()
+                    .DropExisting()
                     .WithEncoding("UTF-8")
                     .ConnectionLimit(-1);
 
