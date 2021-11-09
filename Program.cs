@@ -18,6 +18,7 @@ using Microsoft.Extensions.Logging;
 using NodaTime;
 using NodaTime.Serialization.SystemTextJson;
 using Npgsql;
+using NpgsqlTypes;
 using Serilog;
 using Serilog.Exceptions;
 using Serilog.Extensions.Logging;
@@ -74,16 +75,17 @@ namespace Test
 
     public class Program
     {
+        public static string database = "test";
+        public static string password = "Password12!";
+        public static string conn = $"User ID=postgres;Password={password};Host=localhost;Port=5432;Database={database};";
+        public static string tenant = Guid.NewGuid().ToString();
+        public static JsonSerializerOptions jsonsettings = new JsonSerializerOptions();
+
         public static async Task Main(string[] args)
         {
-            var database = "test";
-            var password = "Password12!";
-            var conn = $"User ID=postgres;Password={password};Host=localhost;Port=5432;Database={database};";
             var store = DocumentStore.For(_ => ConfigureMarten(_, conn));
-            var jsonsettings = new JsonSerializerOptions();
             ConfigureJsonSerializerOptions(jsonsettings);
 
-            var tenant = Guid.NewGuid().ToString();
             await using var session = store.OpenSession(tenant);
             var site = Guid.NewGuid();
             var site2 = Guid.NewGuid();
@@ -105,34 +107,51 @@ namespace Test
             };
             Update(new() { createEv, createEv2, createFoo });
 
-            await using var npg = new NpgsqlConnection(conn);
-            await npg.OpenAsync();
-            var t = await npg.BeginTransactionAsync();
+            //1. Invoke HTTP endpoint, pass in name of entity
+            //2. Convert entity name to Type, throw if invalid
+            //3. Load events
+            //4. Lookup Folder given Type (Ill need to turn the array of tuples into a dictionary)
+            //5. Rebuild Projection
+            //6. Update Table (I'll need to extract the logic between aggregate and singleton projections)
 
-            await using var cmd = new NpgsqlCommand("delete from mt_doc_site;", npg);
-            await cmd.ExecuteNonQueryAsync();
-            System.Console.WriteLine(sites.Count);
-            foreach (var s in sites)
-            {
-                await using (var insert = new NpgsqlCommand("insert into @table values (@id, @tenant_id, @data, @mt_last_Modified, @mt_version, @mt_dotnet_type);", npg))
-                {
-                    cmd.Parameters.AddWithValue("table", "mt_doc_site");
-                    cmd.Parameters.AddWithValue("id", tenant);
-                    cmd.Parameters.AddWithValue("tenant_id", s.Key);
-                    cmd.Parameters.AddWithValue("data", JsonSerializer.Serialize(s.Value, jsonsettings));
-                    cmd.Parameters.AddWithValue("mt_last_Modified", "NOW()");
-                    cmd.Parameters.AddWithValue("mt_version", Guid.NewGuid());
-                    cmd.Parameters.AddWithValue("mt_dotnet_type", typeof(Site).FullName!);
-
-                    await cmd.ExecuteNonQueryAsync();
-                }
-            }
-            await t.CommitAsync();
+            await UpdateTable(sites, "Site");
 
             var sites2 = await session.Query<Site>().ToListAsync();
             foreach (var s in sites2)
                 System.Console.WriteLine(s);
             System.Console.WriteLine("Done");
+        }
+
+        public static async Task UpdateTable(Dictionary<Guid, object> entities, string entity)
+        {
+            var entityType = Type.GetType(entity) ?? throw new NotSupportedException("No entity by this name exists");
+            var table = $"mt_doc_{entityType.Name.ToLower()}";
+
+            await using var npg = new NpgsqlConnection(conn);
+            await npg.OpenAsync();
+            var transaction = await npg.BeginTransactionAsync();
+
+            await using var truncate = new NpgsqlCommand("delete from mt_doc_site;", npg);
+            await truncate.ExecuteNonQueryAsync();
+            //TODO: Extract this logic into 2 different functions
+            //One for Aggregate Projections
+            //Another for Singleton
+            //Then inject inside more general Update logic
+            foreach (var e in entities)
+            {
+                await using (var insert = new NpgsqlCommand("insert into @table values (@id, @tenant_id, @data, NOW(), @mt_version, @mt_dotnet_type);", npg))
+                {
+                    insert.Parameters.AddWithValue("table", "mt_doc_site");
+                    insert.Parameters.AddWithValue("id", e.Key);
+                    insert.Parameters.AddWithValue("tenant_id", tenant);
+                    insert.Parameters.AddWithValue("data", NpgsqlDbType.Jsonb, JsonSerializer.Serialize(e.Value, jsonsettings));
+                    insert.Parameters.AddWithValue("mt_version", Guid.NewGuid());
+                    insert.Parameters.AddWithValue("mt_dotnet_type", typeof(Site).FullName!);
+
+                    await insert.ExecuteNonQueryAsync();
+                }
+            }
+            await transaction.CommitAsync();
         }
 
         public static Action<StoreOptions, string> ConfigureMarten => (_, connectionString) =>
