@@ -1,5 +1,4 @@
-﻿using System.Linq;
-using System.Text.Json;
+﻿using System.Text.Json;
 using System.Text.Json.Serialization;
 using Dahomey.Json;
 using Dahomey.Json.Serialization.Conventions;
@@ -14,14 +13,10 @@ using Marten.NodaTime;
 using Marten.Services;
 using Marten.Services.Json;
 using Marten.Storage;
-using Microsoft.Extensions.Logging;
 using NodaTime;
 using NodaTime.Serialization.SystemTextJson;
 using Npgsql;
 using NpgsqlTypes;
-using Serilog;
-using Serilog.Exceptions;
-using Serilog.Extensions.Logging;
 using TupleAsJsonArray;
 
 namespace Value
@@ -100,58 +95,71 @@ namespace Test
             session.Events.StartStream(createFoo.Id, createFoo);
             session.SaveChanges();
 
-            var sites = new Dictionary<Guid, Site>();
-            Projections.Add(typeof(Site), sites);
-            Folders = new (dynamic, dynamic, dynamic)[] {
-                Folder<Site, Dictionary<Guid, Site>>(FoldDictionary<Site>(Site.Apply, Site.Create)),
-            };
-            Update(new() { createEv, createEv2, createFoo });
+            Folders = new KeyValuePair<Type, (dynamic, dynamic, Func<dynamic, Task>)>[] {
+                new(typeof(Site), (FoldTenantedDictionary<Site>(Site.Apply, Site.Create), new Dictionary<(Guid, string), Site>(), async table => await UpdateTable(typeof(Site), table)))
+            }.ToDictionary(x => x.Key, x => x.Value);
 
             //1. Invoke HTTP endpoint, pass in name of entity
             //2. Convert entity name to Type, throw if invalid
             //3. Load events
-            //4. Lookup Folder given Type (Ill need to turn the array of tuples into a dictionary)
+            //4. Lookup Folder given Type
             //5. Rebuild Projection
-            //6. Update Table (I'll need to extract the logic between aggregate and singleton projections)
+            //6. Update Table
 
-            await UpdateTable(sites, "Site");
+            async Task UpdateTable(Type projectionType, dynamic data)
+            {
+                var table = $"mt_doc_{projectionType.Name.ToLower()}";
+                await using var npg = new NpgsqlConnection(conn);
+                await npg.OpenAsync();
+                var transaction = await npg.BeginTransactionAsync();
 
-            var sites2 = await session.Query<Site>().ToListAsync();
-            foreach (var s in sites2)
+                await using var truncate = new NpgsqlCommand($"delete from {table};", npg);
+                await truncate.ExecuteNonQueryAsync();
+
+                foreach (var kvp in data)
+                {
+                    await using (var insert = new NpgsqlCommand($"insert into {table} values (@id, @tenant_id, @data, NOW(), @mt_version, @mt_dotnet_type);", npg))
+                    {
+                        insert.Parameters.AddWithValue("id", kvp.Key.Item1);
+                        insert.Parameters.AddWithValue("tenant_id", kvp.Key.Item2);
+                        insert.Parameters.AddWithValue("data", NpgsqlDbType.Jsonb, JsonSerializer.Serialize(kvp.Value, jsonsettings));
+                        insert.Parameters.AddWithValue("mt_version", Guid.NewGuid());
+                        insert.Parameters.AddWithValue("mt_dotnet_type", projectionType.FullName!);
+
+                        await insert.ExecuteNonQueryAsync();
+                    }
+                }
+                await transaction.CommitAsync();
+            }
+
+            async Task<IEnumerable<(IEvent, string)>> LoadEvents()
+            {
+                return (await session.Events.QueryAllRawEvents().ToListAsync()).Select(e => ((IEvent)e.Data, e.TenantId));
+            }
+
+            async Task ApplyEvents<T>(IEnumerable<T> events, Type projectionType)
+            {
+                var (folder, projection, set) = Folders[projectionType];
+                dynamic p = projection;
+                foreach (var ev in events)
+                    p = folder(p, ev);
+                await set(p);
+            }
+
+            async Task RebuildProjections(string[] projections)
+            {
+                var events = await LoadEvents();
+                foreach (var p in projections)
+                    await ApplyEvents(events, Type.GetType($"Test.{p}") ?? throw new NotSupportedException("No entity by this name exists"));
+            }
+
+            await RebuildProjections(new[] { "Site" });
+
+
+            var sites = await session.Query<Site>().ToListAsync();
+            foreach (var s in sites)
                 System.Console.WriteLine(s);
             System.Console.WriteLine("Done");
-        }
-
-        public static async Task UpdateTable(Dictionary<Guid, object> entities, string entity)
-        {
-            var entityType = Type.GetType(entity) ?? throw new NotSupportedException("No entity by this name exists");
-            var table = $"mt_doc_{entityType.Name.ToLower()}";
-
-            await using var npg = new NpgsqlConnection(conn);
-            await npg.OpenAsync();
-            var transaction = await npg.BeginTransactionAsync();
-
-            await using var truncate = new NpgsqlCommand("delete from mt_doc_site;", npg);
-            await truncate.ExecuteNonQueryAsync();
-            //TODO: Extract this logic into 2 different functions
-            //One for Aggregate Projections
-            //Another for Singleton
-            //Then inject inside more general Update logic
-            foreach (var e in entities)
-            {
-                await using (var insert = new NpgsqlCommand("insert into @table values (@id, @tenant_id, @data, NOW(), @mt_version, @mt_dotnet_type);", npg))
-                {
-                    insert.Parameters.AddWithValue("table", "mt_doc_site");
-                    insert.Parameters.AddWithValue("id", e.Key);
-                    insert.Parameters.AddWithValue("tenant_id", tenant);
-                    insert.Parameters.AddWithValue("data", NpgsqlDbType.Jsonb, JsonSerializer.Serialize(e.Value, jsonsettings));
-                    insert.Parameters.AddWithValue("mt_version", Guid.NewGuid());
-                    insert.Parameters.AddWithValue("mt_dotnet_type", typeof(Site).FullName!);
-
-                    await insert.ExecuteNonQueryAsync();
-                }
-            }
-            await transaction.CommitAsync();
         }
 
         public static Action<StoreOptions, string> ConfigureMarten => (_, connectionString) =>
@@ -193,55 +201,51 @@ namespace Test
             var objectMap = options.GetObjectMappingRegistry();
         }
 
-        protected static Func<Dictionary<Guid, T>, IEvent, Dictionary<Guid, T>> FoldDictionary<T>(Func<T, IEvent, T> fold, Func<ICreateEvent, T?> defaultState, Type? deleteEvent = null)
-            => new Func<Dictionary<Guid, T>, IEvent, Dictionary<Guid, T>>(
-                (dictionary, ev) =>
+        // protected static Func<Dictionary<Guid, T>, IEvent, Dictionary<Guid, T>> FoldDictionary<T>(Func<T, IEvent, T> fold, Func<ICreateEvent, T?> defaultState, Type? deleteEvent = null)
+        //     => new Func<Dictionary<Guid, T>, IEvent, Dictionary<Guid, T>>(
+        //         (dictionary, ev) =>
+        //         {
+        //             if (ev is IEvent e)
+        //             {
+        //                 if (ev.GetType() == deleteEvent)
+        //                     dictionary.Remove(ev.Id);
+        //                 else if (dictionary.ContainsKey(ev.Id))
+        //                     dictionary[ev.Id] = fold(dictionary[ev.Id], ev);
+        //                 else
+        //                     if (ev is ICreateEvent create)
+        //                 {
+        //                     var state = defaultState(create);
+        //                     if (state is null) return dictionary;
+        //                     dictionary.Add(ev.Id, fold(state, ev));
+        //                 }
+
+        //             }
+        //             return dictionary;
+        //         });
+
+        protected static Func<Dictionary<(Guid, string), T>, (IEvent, string), Dictionary<(Guid, string), T>> FoldTenantedDictionary<T>(Func<T, IEvent, T> fold, Func<ICreateEvent, T?> defaultState, Type? deleteEvent = null)
+            => new Func<Dictionary<(Guid, string), T>, (IEvent, string), Dictionary<(Guid, string), T>>(
+                (dictionary, eventTenant) =>
                 {
+                    var (ev, tenant) = eventTenant;
+                    var key = (ev.Id, tenant);
                     if (ev is IEvent e)
                     {
                         if (ev.GetType() == deleteEvent)
-                            dictionary.Remove(ev.Id);
-                        else if (dictionary.ContainsKey(ev.Id))
-                            dictionary[ev.Id] = fold(dictionary[ev.Id], ev);
+                            dictionary.Remove(key);
+                        else if (dictionary.ContainsKey(key))
+                            dictionary[key] = fold(dictionary[key], ev);
                         else
                             if (ev is ICreateEvent create)
                         {
                             var state = defaultState(create);
                             if (state is null) return dictionary;
-                            dictionary.Add(ev.Id, fold(state, ev));
+                            dictionary.Add(key, fold(state, ev));
                         }
-
                     }
                     return dictionary;
                 });
 
-        protected static (dynamic, dynamic, dynamic) Folder<T, TProjection>(Func<TProjection, IEvent, TProjection> fold) => (fold, Projections[typeof(T)], new Action<dynamic>(x => Projections[typeof(T)] = x));
-        protected static (dynamic, dynamic, dynamic)[] Folders { get; set; } = Array.Empty<(dynamic, dynamic, dynamic)>();
-        protected static Dictionary<Type, dynamic> Projections { get; } = new();
-
-        public static List<IEvent> Events { get; } = new();
-        public static void Update(List<IEvent> events)
-        {
-            Events.AddRange(events);
-            foreach (var (folder, projection, set) in Folders)
-            {
-                dynamic p = projection;
-                foreach (var ev in events)
-                    p = folder(p, ev);
-                set(p);
-            }
-        }
-
-        public void Update(List<ICreateEvent> events)
-        {
-            Events.AddRange(events);
-            foreach (var (folder, projection, set) in Folders)
-            {
-                dynamic p = projection;
-                foreach (var ev in events)
-                    p = folder(p, ev);
-                set(p);
-            }
-        }
+        protected static Dictionary<Type, (dynamic, dynamic, Func<dynamic, Task>)> Folders { get; set; } = new();
     }
 }
